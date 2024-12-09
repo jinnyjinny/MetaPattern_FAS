@@ -8,7 +8,8 @@ import logging
 from torch.optim import SGD
 from typing import Dict, List, Tuple, Optional
 from copy import deepcopy
-
+from sklearn.metrics import roc_auc_score, roc_curve
+import numpy as np
 from .trainer import Trainer, get_data_from_loader_list
 from .meta_network import MetaHierachicalFusionNetwork, MetaPatternExtractor
 from .network import get_state_dict
@@ -58,9 +59,35 @@ class BaseMetaTrainer(Trainer): #
             {"data_loader": src2_train_dataloader_fake, "iterator": iter(src2_train_dataloader_fake)},
             {"data_loader": src3_train_dataloader_fake, "iterator": iter(src3_train_dataloader_fake)}
         ]
-
         return real_loaders, fake_loaders, tgt_valid_dataloader
+    def _split_support_query(self, data):
+        images, labels = data[1], data[2]
 
+        depths, labels = labels['pixel_maps'], labels['face_label']
+
+        # depths = [x.cuda() for x in depths] 
+
+        images = images
+
+        # Support와 Query로 나누기 위한 인덱스
+        split_idx = self.config.DATA.BATCH_SIZE//2
+
+        # Support 데이터
+        support_images = images[:split_idx]
+        support_labels = labels[:split_idx]
+        support_depths = [d[:split_idx] for d in depths]
+
+        # Query 데이터
+        query_images = images[split_idx:]
+        query_labels = labels[split_idx:]
+        query_depths = [d[split_idx:] for d in depths]
+
+        # 반환 (Support, Query)
+        support_data = (support_images, support_labels, support_depths)
+        query_data = (query_images, query_labels, query_depths)
+
+        return support_data, query_data   
+    
     def _compute_loss(self, outputs: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> torch.Tensor:
         img_colored, reconstruct_rgb = outputs['colored']
         depth_pred, cls_preds = outputs['predictions']
@@ -92,19 +119,24 @@ class BaseMetaTrainer(Trainer): #
     def _forward_pass(self, 
                     image: torch.Tensor,
                     extractor_params: Optional[OrderedDict] = None,
+                    hfn = None,
+                    pattern_extractor = None,
                     hfn_params: Optional[OrderedDict] = None) -> Dict[str, torch.Tensor]:
         if not image.is_cuda:
             image = image.cuda()
-            
-        img_colored, reconstruct_rgb = self.pattern_extractor(
+        if pattern_extractor is None:
+            pattern_extractor = self.pattern_extractor
+        if hfn is None:
+            hfn = self.hfn
+        img_colored, reconstruct_rgb = pattern_extractor(
             image,
             params=extractor_params
         )
 
         if hfn_params is not None:
-            depth_pred, cls_preds = self.hfn(image, img_colored, params=hfn_params)
+            depth_pred, cls_preds = hfn(image, img_colored, params=hfn_params)
         else:
-            depth_pred, cls_preds = self.hfn(image, img_colored)
+            depth_pred, cls_preds = hfn(image, img_colored)
         
         return {
             'colored': (img_colored, reconstruct_rgb),
@@ -189,27 +221,34 @@ class BaseMetaTrainer(Trainer): #
 class PatternExtractorMAMLTrainer(BaseMetaTrainer):
     def __init__(self, config, hfn):
         super(PatternExtractorMAMLTrainer, self).__init__(config)
+        # self.pe_optimizer = optim.Adam(
+        #     self.pattern_extractor.parameters(),
+        #     lr=self.inner_lr
+        # )
         self.meta_optimizer = optim.Adam(
-            self.pattern_extractor.parameters(),
+            list(self.pattern_extractor.parameters()) + list(hfn.parameters()),
             lr=self.meta_lr
         )
         self.hfn = hfn
         # self.hfn.eval()
-    def _maml_adaptation(self, support_data: Tuple[torch.Tensor, ...]) -> Tuple[OrderedDict, float]:
+    def _maml_adaptation(self, support_data: Tuple[torch.Tensor, ...], hfn = None, pattern_extractor = None) -> Tuple[OrderedDict, float]:
         images, labels, depths = support_data
         images = images.cuda()
         labels = labels.cuda()
         depths = [d.cuda() for d in depths]
-
+        if hfn is None:
+            hfn = self.hfn
+        if pattern_extractor is None:
+            pattern_extractor = self.pattern_extractor
         adapted_extractor_dict = OrderedDict(
             (name, param.clone())
-            for name, param in self.pattern_extractor.named_parameters()
+            for name, param in pattern_extractor.named_parameters()
             if param.requires_grad
         )
 
         for _ in range(self.inner_steps):
-            img_colored, reconstruct_rgb = self.pattern_extractor(images, params=adapted_extractor_dict)
-            depth_pred, cls_preds = self.hfn(images, img_colored)
+            img_colored, reconstruct_rgb = pattern_extractor(images, params=adapted_extractor_dict)
+            depth_pred, cls_preds = hfn(images, img_colored)
             
             outputs = {
                 'colored': (img_colored, reconstruct_rgb),
@@ -234,7 +273,8 @@ class PatternExtractorMAMLTrainer(BaseMetaTrainer):
     def train(self):
         logging.info("Starting MAML Feature Extractor Training")
         pattern_extractor = self._maml_train()
-        return pattern_extractor
+        meta_test_output = self.meta_test()
+        return pattern_extractor, meta_test_output
 
 
     def _maml_train(self):
@@ -298,6 +338,90 @@ class PatternExtractorMAMLTrainer(BaseMetaTrainer):
             if iter_num % (self.config.TRAIN.VAL_FREQ * self.config.TRAIN.ITER_PER_EPOCH) == 0:
                 self._validate_and_save(iter_num)
         return self.pattern_extractor
+    
+
+     
+    def meta_test(self, fixed_fpr=0.01):
+        logging.info("Starting Meta-Test on Validation Data")
+        # self.pattern_extractor.eval()
+        # self.hfn.eval()
+        
+        total_loss = 0.0
+        total_batches = 0
+        
+        # Initialize as lists instead of numpy arrays
+        all_labels = []
+        all_scores = []
+        predictions = []
+        
+        for batch_idx, data in enumerate(self.tgt_valid_dataloader):
+            meta_test_model = deepcopy(self.hfn)
+            meta_extractor = deepcopy(self.pattern_extractor)
+            meta_test_optimizer = optim.Adam(
+                    list(meta_extractor.parameters()) + list(meta_test_model.parameters()),
+                    lr=self.meta_lr
+                )
+            meta_test_optimizer.zero_grad()
+            support_data, query_data = self._split_support_query(data)
+            adapted_params, support_loss = self._maml_adaptation(support_data, hfn=meta_test_model, pattern_extractor=meta_extractor)
+       
+            
+            query_images, query_labels, query_depths = query_data
+            query_outputs = self._forward_pass(query_images, extractor_params=adapted_params, hfn=meta_test_model, pattern_extractor=meta_extractor)
+            query_targets = {
+                'image': query_images.cuda(),
+                'label': query_labels.cuda(),
+                'depth': [d.cuda() for d in query_depths]
+            }
+            query_loss = self._compute_loss(query_outputs, query_targets)
+            query_loss.backward()
+            meta_test_optimizer.step()
+        
+
+            _, cls_preds = query_outputs['predictions']
+            probabilities = torch.softmax(cls_preds[0], dim=1)[:, 1].detach().cpu().numpy()
+            # Extend lists with batch results
+            all_scores.extend(probabilities.tolist())
+            all_labels.extend(query_labels.cpu().tolist())
+            predictions.extend((cls_preds[0].argmax(dim=1)).cpu().tolist())
+            
+            total_loss += query_loss.item()
+            total_batches += 1
+        
+        # Compute Average Loss
+        avg_loss = total_loss / total_batches
+        
+        # Convert lists to numpy arrays for metric calculations
+        all_labels = np.array(all_labels)
+        all_scores = np.array(all_scores)
+        
+        # AUC
+        if len(np.unique(all_labels)) < 2:
+            logging.warning("Only one class present in y_true. AUC cannot be calculated.")
+            auc = None
+        else:
+            auc = roc_auc_score(all_labels, all_scores)
+        
+        # FAR, FRR, HTER
+        if len(np.unique(all_labels)) > 1:
+            fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+            far = fpr
+            frr = 1 - tpr
+            hter = np.mean((far + frr) / 2)
+            tpr_at_fixed_fpr = tpr[np.argmax(fpr >= fixed_fpr)] if fixed_fpr in fpr else 0.0
+        else:
+            hter = None
+            tpr_at_fixed_fpr = None
+        
+        logging.info(f"Meta-Test Results - Loss: {avg_loss:.4f}, AUC: {auc}, HTER: {hter}, TPR@FPR={fixed_fpr:.2f}: {tpr_at_fixed_fpr}")
+        
+        return {
+            'loss': avg_loss,
+            'auc': auc,
+            'hter': hter,
+            f'tpr_at_fpr_{fixed_fpr}': tpr_at_fixed_fpr
+        }
+
     def _log_training_stats(self, iter_num, epoch_loss, epoch_acc, batch_count):
         avg_loss = epoch_loss / batch_count
         avg_acc = epoch_acc / batch_count
@@ -308,68 +432,63 @@ class PatternExtractorReptileTrainer(BaseMetaTrainer):
     def __init__(self, config, hfn):
         super(PatternExtractorReptileTrainer, self).__init__(config)
         self.meta_optimizer = optim.Adam(
-            self.pattern_extractor.parameters(),
+            list(self.pattern_extractor.parameters()) + list(hfn.parameters()),
             lr=self.meta_lr
         )
         self.hfn = hfn
         # self.hfn.eval()
-    def _reptile_inner_loop(self, task_data: Tuple[torch.Tensor, ...], num_steps: int) -> Tuple[OrderedDict, OrderedDict]:
-       images, labels, depths = task_data
-       images = images.cuda()
-       labels = labels.cuda()
-       depths = [d.cuda() for d in depths]
-       
-       initial_extractor_params = OrderedDict(
-           (name, param.clone()) 
-           for name, param in self.pattern_extractor.named_parameters()
-       )
-       initial_hfn_params = OrderedDict(
-           (name, param.clone())
-           for name, param in self.hfn.named_parameters() 
-       )
-       
-       inner_optimizer_extractor = SGD(self.pattern_extractor.parameters(), lr=self.inner_lr)
-       inner_optimizer_hfn = SGD(self.hfn.parameters(), lr=self.inner_lr)
-       
-       for _ in range(num_steps):
-           img_colored, reconstruct_rgb = self.pattern_extractor(images)
-           depth_pred, cls_preds = self.hfn(images, img_colored)
-           
-           outputs = {
-               'colored': (img_colored, reconstruct_rgb),
-               'predictions': (depth_pred, cls_preds)
-           }
-           
-           loss = self._compute_loss(outputs, {'image': images, 'label': labels, 'depth': depths})
-           
-           inner_optimizer_extractor.zero_grad()
-           inner_optimizer_hfn.zero_grad()
-           loss.backward()
-           inner_optimizer_extractor.step()
-           inner_optimizer_hfn.step()
-       
-       final_extractor_params = OrderedDict(
-           (name, param.clone())
-           for name, param in self.pattern_extractor.named_parameters()
-       )
-       final_hfn_params = OrderedDict(
-           (name, param.clone())
-           for name, param in self.hfn.named_parameters()
-       )
-       
-       for name, param in self.pattern_extractor.named_parameters():
-           param.data.copy_(initial_extractor_params[name].data)
-       for name, param in self.hfn.named_parameters():
-           param.data.copy_(initial_hfn_params[name].data)
-       
-       return final_extractor_params, final_hfn_params
+    def _reptile_inner_loop(self, task_data: Tuple[torch.Tensor, ...], num_steps: int, pattern_extractor = None, hfn = None) -> Tuple[OrderedDict, OrderedDict]:
+        images, labels, depths = task_data
+        images = images.cuda()
+        labels = labels.cuda()
+        depths = [d.cuda() for d in depths]
+        
+        if pattern_extractor is None:
+            pattern_extractor = self.pattern_extractor
+        if hfn is None:
+            hfn = hfn
+
+        initial_extractor_params = OrderedDict(
+            (name, param.clone()) 
+            for name, param in pattern_extractor.named_parameters()
+        )
+        inner_optimizer = optim.SGD(pattern_extractor.parameters(), lr=self.inner_lr)
+        
+        for _ in range(num_steps):
+            img_colored, reconstruct_rgb = pattern_extractor(images)
+            depth_pred, cls_preds = hfn(images, img_colored)
+            
+            outputs = {
+                'colored': (img_colored, reconstruct_rgb),
+                'predictions': (depth_pred, cls_preds)
+            }
+            
+            loss = self._compute_loss(outputs, {'image': images, 'label': labels, 'depth': depths})
+            
+            inner_optimizer.zero_grad()
+            loss.backward()
+            inner_optimizer.step()
+        
+        final_extractor_params = OrderedDict(
+            (name, param.clone())
+            for name, param in pattern_extractor.named_parameters()
+        )
+
+        
+        for name, param in pattern_extractor.named_parameters():
+            param.data.copy_(initial_extractor_params[name].data)
+
+        
+        return final_extractor_params
 
     def train(self):
         logging.info("Starting Reptile Feature Extractor Training")
         pattern_extractor = self._reptile_train()
-        return pattern_extractor
+        meta_test_output = self.meta_test()
+        return pattern_extractor, meta_test_output
 
     def _reptile_train(self):
+        logging.info("Starting Reptile Training")
         pbar = tqdm(range(1, self.config.TRAIN.MAX_ITER + 1), ncols=160)
         epoch_loss = 0.0
         epoch_acc = 0.0
@@ -382,40 +501,131 @@ class PatternExtractorReptileTrainer(BaseMetaTrainer):
                 [self.fake_loaders[task_idx]]
             )
             
-            final_extractor_params, final_hfn_params = self._reptile_inner_loop(task_data, self.inner_steps)
-            meta_lr = self.meta_lr * (1 - iter_num / self.config.TRAIN.MAX_ITER)
+            final_extractor_params = self._reptile_inner_loop(task_data, self.inner_steps)
+            self.meta_optimizer.zero_grad()
+      
             for name, param in self.pattern_extractor.named_parameters():
-                param.data.add_(meta_lr * (final_extractor_params[name].data - param.data))
-            for name, param in self.hfn.named_parameters():
-                param.data.add_(meta_lr * (final_hfn_params[name].data - param.data))
+                param.grad = (param.data - final_extractor_params[name].data) / self.meta_lr
 
             images = task_data[0].cuda()
             labels = task_data[1].cuda()
             depths = [d.cuda() for d in task_data[2]]
-            
-            outputs = self._forward_pass(images)
-            targets = {
-                'image': images,
-                'label': labels,
-                'depth': depths
+            img_colored, reconstruct_rgb = self.pattern_extractor(images)
+            depth_pred, cls_preds = self.hfn(images, img_colored)
+            outputs = {
+                'colored': (img_colored, reconstruct_rgb),
+                'predictions': (depth_pred, cls_preds)
             }
+            meta_loss = self._compute_loss(outputs, {'image': images, 'label': labels, 'depth': depths})
+            meta_loss.backward()
             
-            current_loss = self._compute_loss(outputs, targets)
-            current_acc = self._compute_accuracy(outputs, targets)
+            # Meta optimizer step
+            self.meta_optimizer.step()
             
-            epoch_loss += current_loss.item()
+            # Calculate training loss and accuracy for logging
+            current_loss = meta_loss.item()
+            current_acc = self._compute_accuracy(outputs, {'image': images, 'label': labels, 'depth': depths})
+            
+            epoch_loss += current_loss
             epoch_acc += current_acc
             batch_count += 1
             
+            # Log training stats every epoch
             if iter_num % self.config.TRAIN.ITER_PER_EPOCH == 0:
                 self._log_training_stats(iter_num, epoch_loss, epoch_acc, batch_count)
                 epoch_loss = 0.0
                 epoch_acc = 0.0
                 batch_count = 0
             
+            # Validation and model checkpointing
             if iter_num % (self.config.TRAIN.VAL_FREQ * self.config.TRAIN.ITER_PER_EPOCH) == 0:
                 self._validate_and_save(iter_num)
+        
         return self.pattern_extractor
+    
+    def meta_test(self, fixed_fpr=0.01):
+        logging.info("Starting Meta-Test on Validation Data")
+        # self.pattern_extractor.eval()
+        # self.hfn.eval()
+        
+        total_loss = 0.0
+        total_batches = 0
+        
+        # Initialize as lists instead of numpy arrays
+        all_labels = []
+        all_scores = []
+        predictions = []
+        
+        for batch_idx, data in enumerate(self.tgt_valid_dataloader):
+            meta_test_model = deepcopy(self.hfn)
+            meta_extractor = deepcopy(self.pattern_extractor)
+            meta_test_optimizer = optim.Adam(
+                    list(meta_extractor.parameters()) + list(meta_test_model.parameters()),
+                    lr=self.meta_lr
+                )
+            meta_test_optimizer.zero_grad()
+            support_data, query_data = self._split_support_query(data)
+            adapted_params = self._reptile_inner_loop(support_data, self.inner_steps, pattern_extractor=meta_extractor, hfn=meta_test_model)
+
+            for name, param in meta_extractor.named_parameters():
+                param.grad = (param.data - adapted_params[name].data) / self.meta_lr
+            
+            query_images, query_labels, query_depths = query_data
+            query_outputs = self._forward_pass(query_images, extractor_params=adapted_params, hfn=meta_test_model, pattern_extractor=meta_extractor)
+            query_targets = {
+                'image': query_images.cuda(),
+                'label': query_labels.cuda(),
+                'depth': [d.cuda() for d in query_depths]
+            }
+            query_loss = self._compute_loss(query_outputs, query_targets)
+            query_loss.backward()
+            meta_test_optimizer.step()
+        
+
+            _, cls_preds = query_outputs['predictions']
+            probabilities = torch.softmax(cls_preds[0], dim=1)[:, 1].detach().cpu().numpy()
+            # Extend lists with batch results
+            all_scores.extend(probabilities.tolist())
+            all_labels.extend(query_labels.cpu().tolist())
+            predictions.extend((cls_preds[0].argmax(dim=1)).cpu().tolist())
+            
+            total_loss += query_loss.item()
+            total_batches += 1
+        
+        # Compute Average Loss
+        avg_loss = total_loss / total_batches
+        
+        # Convert lists to numpy arrays for metric calculations
+        all_labels = np.array(all_labels)
+        all_scores = np.array(all_scores)
+        
+        # AUC
+        if len(np.unique(all_labels)) < 2:
+            logging.warning("Only one class present in y_true. AUC cannot be calculated.")
+            auc = None
+        else:
+            auc = roc_auc_score(all_labels, all_scores)
+        
+        # FAR, FRR, HTER
+        if len(np.unique(all_labels)) > 1:
+            fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+            far = fpr
+            frr = 1 - tpr
+            hter = np.mean((far + frr) / 2)
+            tpr_at_fixed_fpr = tpr[np.argmax(fpr >= fixed_fpr)] if fixed_fpr in fpr else 0.0
+        else:
+            hter = None
+            tpr_at_fixed_fpr = None
+        
+        logging.info(f"Meta-Test Results - Loss: {avg_loss:.4f}, AUC: {auc}, HTER: {hter}, TPR@FPR={fixed_fpr:.2f}: {tpr_at_fixed_fpr}")
+        
+        return {
+            'loss': avg_loss,
+            'auc': auc,
+            'hter': hter,
+            f'tpr_at_fpr_{fixed_fpr}': tpr_at_fixed_fpr
+        }
+
     
     def _log_training_stats(self, iter_num, epoch_loss, epoch_acc, batch_count):
         avg_loss = epoch_loss / batch_count
@@ -664,7 +874,7 @@ class MetaTrainerManager(Trainer):
 
         return real_loaders, fake_loaders, tgt_valid_dataloader
 
-    def train(self, pe_method: str = 'base', hfn_method: str = 'base'):
+    def train(self, pe_method: str):
         """
         학습 시작
         :param pe_method: 'base', 'maml', 'reptile'
@@ -683,8 +893,8 @@ class MetaTrainerManager(Trainer):
                 dropout_rate=self.config.TRAIN.DROPOUT
                 ).cuda()
             hfn.load_state_dict(imagenet_pretrain, strict=False)
-        if self.config.TRAIN.PRETRAIN_HFN:
-            hfn = self.pretrain_hfn(0, hfn)
+        # if self.config.TRAIN.PRETRAIN_HFN:
+        #     hfn = self.pretrain_hfn(0, hfn)
         logging.info(f"Training pattern extractor with {pe_method}")
         if pe_method == 'base':
             pe = MetaPatternExtractor().cuda()
@@ -705,13 +915,13 @@ class MetaTrainerManager(Trainer):
         else:
             raise ValueError(f"Unknown pattern extractor method: {pe_method}")
         
-        logging.info(f"Training HFN with {hfn_method}")
-        if hfn_method == 'base':
-            hfn = self.train_hfn_from_scratch(pattern_extractor)  
-        elif hfn_method in ['maml', 'reptile']:
-            hfn = self._train_hfn_with_custom_method('hfn', hfn_method, pattern_extractor)
-        else:
-            raise ValueError(f"Unknown HFN method: {hfn_method}")
+        # logging.info(f"Training HFN with {hfn_method}")
+        # if hfn_method == 'base':
+        #     hfn = self.train_hfn_from_scratch(pattern_extractor)  
+        # elif hfn_method in ['maml', 'reptile']:
+        #     hfn = self._train_hfn_with_custom_method('hfn', hfn_method, pattern_extractor)
+        # else:
+        #     raise ValueError(f"Unknown HFN method: {hfn_method}")
         
     def pretrain_hfn(self, data_num, hfn = None):
         """
